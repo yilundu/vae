@@ -18,6 +18,7 @@ mpl.use('Agg')
 import matplotlib.pyplot as plt
 import seaborn as sns
 sns.set()
+import numpy as np
 
 FLAGS = flags.FLAGS
 
@@ -39,8 +40,12 @@ flags.DEFINE_integer('latent_dim', 5,
     'dimensionality of latent dim')
 flags.DEFINE_integer('hidden_dim', 400,
     'number of hidden dimensions')
-flags.DEFINE_bool('gen_plots', True,
+flags.DEFINE_bool('gen_plots', False,
     'generate loss curves over iterations')
+flags.DEFINE_bool('estimate_prob', False,
+    'Monte carlo estimate of the log liklihood')
+flags.DEFINE_bool('latent_traversal', False,
+    'visualize latent_traversal')
 
 class FreyFaces(Dataset):
 
@@ -81,6 +86,7 @@ class VAE(nn.Module):
             self.decode_output = nn.Linear(nh, 2 * input_dim)
 
         self.hidden_dim = hidden_dim
+        self.latent_dim = hidden_dim
         self.input_dim = input_dim
 
     def forward(self, inp):
@@ -106,22 +112,27 @@ class VAE(nn.Module):
 
         return (mean, log_var), output
 
-    def compute_loss(self, output, inp, loss_type):
+    def compute_loss(self, output, inp):
         (mean, log_var), output = output
         kl_loss = (-0.5 * (1 + log_var - mean.pow(2) - log_var.exp())).sum(dim=1).mean(dim=0)
+        prob_loss = self.compute_prob(output, inp)
 
-        if loss_type == "bce":
+        return kl_loss + prob_loss
+
+    def compute_prob(self, output, inp):
+        if self.prob_dist == "discrete":
             prob_loss = (F.binary_cross_entropy(output, inp, reduction='none').sum(dim=1).mean(dim=0))
-        elif loss_type == "gauss":
+        elif self.prob_dist == "continuous":
             mean, log_var = output[:, :self.input_dim], output[:, self.input_dim:]
             exp_term = ((inp - mean).pow(2) / (2 * log_var.exp())).sum(dim=1).mean(dim=0)
             norm_term = 0.5 * (log_var.sum(dim=1)).mean(dim=0)
             prob_loss = exp_term + norm_term
 
-        return kl_loss + prob_loss
+        return prob_loss
 
-    def generate_sample(self):
-        z = torch.randn(64, self.hidden_dim).cuda()
+    def generate_sample(self, z=None):
+        if z is None:
+            z = torch.randn(64, self.hidden_dim).cuda()
         decode_hidden = F.relu(self.decode_fc(z))
         output = self.decode_output(decode_hidden)
 
@@ -139,13 +150,56 @@ class VAE(nn.Module):
 
     def sample_posterior(self, x, batch=256):
         """Approximates sampling from p(z|x) using Langevin dynamics"""
+        x = x.unsqueeze(1).repeat(1, batch, 1).view(-1, x.size(1))
+        z = torch.randn(x.size(0), self.latent_dim, requires_grad=True).cuda()
+
         for i in range(100):
-            pass
+            decode_hidden = F.relu(self.decode_fc(z))
+            output = self.decode_output(decode_hidden)
+            output = F.sigmoid(output)
+
+            cond_prob = self.compute_prob(output, x)
+            z_prob = z.pow(2).sum(dim=1).mean(dim=0)
+            tot_prob = cond_prob + z_prob
+
+            z_grad = torch.autograd.grad([tot_prob], [z])[0]
+            z = z - 40 * z_grad + torch.randn_like(z) * 0.01
+        print(z_grad.abs().mean())
+
+        return z
 
 
     def estimate_prob(self, inp):
         """Returns to a Monte Carlo estimate of the negative log likelihood of samples"""
+        batch_size=128
+        z = self.sample_posterior(inp, batch=batch_size)
+        z = z.view(-1, batch_size, self.latent_dim)
 
+        # Use 128 of the latents to do a kernal density estimate and the other 128
+        # to evaluate the log likelihood
+        z_kernel = z[:, :batch_size//2]
+        z_sample = z[:, batch_size//2:]
+
+        # Compute the probabilities
+        # log(q(z)) - log(p(z)) - log(p(x|z))
+
+        decode_sample = F.relu(self.decode_fc(z_sample))
+        output = self.decode_output(decode_sample)
+        output = F.sigmoid(output)
+
+        inp = inp.unsqueeze(1)
+        p_xz = -F.binary_cross_entropy(output, inp.repeat(1, batch_size//2, 1), reduction='none').sum(dim=2)
+
+        p_z = -(z_sample.pow(2) * 0.5).sum(dim=-1) - self.latent_dim * 0.5 * np.log(np.pi)
+
+        sigma = 0.1
+        z_kernel, z_sample = z_kernel.unsqueeze(2), z_sample.unsqueeze(1)
+        z_diff = -0.5 * (z_kernel - z_sample).pow(2) / (sigma ** 2) - 0.5 * np.log(np.pi) - np.log(sigma)
+        q_z = z_diff.sum(dim=3).logsumexp(dim=2) - np.log(self.latent_dim)
+
+        log_prob = (q_z - p_z - p_xz).logsumexp(dim=1) - np.log(batch_size//2)
+
+        return -log_prob.mean(dim=0)
 
 
 def main():
@@ -156,8 +210,8 @@ def main():
         input_dim = 784
         prob_dist = "discrete"
     else:
-        train_dataloader = DataLoader(FreyFaces(train=True), batch_size=32)
-        test_dataloader = DataLoader(FreyFaces(train=False), batch_size=32)
+        train_dataloader = DataLoader(FreyFaces(train=True), batch_size=FLAGS.batch_size)
+        test_dataloader = DataLoader(FreyFaces(train=False), batch_size=FLAGS.batch_size)
         input_dim = 560
         prob_dist = "continuous"
 
@@ -197,20 +251,27 @@ def main():
                 outputs = model.forward(dat)
 
                 if FLAGS.dataset == "mnist":
-                    loss = model.compute_loss(outputs, dat, "bce")
+                    loss = model.compute_loss(outputs, dat)
                 else:
-                    loss = model.compute_loss(outputs, dat, "gauss")
+                    loss = model.compute_loss(outputs, dat)
 
                 loss.backward()
                 optimizer.step()
 
-                if it % (10 * FLAGS.batch_size) == 0:
+                if it % (100 * FLAGS.batch_size) == 0:
                     loss = loss.item()
                     logger.writekvs({"loss": loss})
                     print(it, loss)
+
                     if FLAGS.gen_plots:
                         its.append(it)
-                        train_losses.append(-1 * loss)
+
+                        if FLAGS.estimate_prob:
+                            estimate_prob = model.estimate_prob(dat).item()
+                            print(estimate_prob)
+                            train_losses.append(estimate_prob)
+                        else:
+                            train_losses.append(-1 * loss)
 
                         try:
                             dat, label = test_dataloader_iter.next()
@@ -226,11 +287,15 @@ def main():
                         outputs = model.forward(dat)
 
                         if FLAGS.dataset == "mnist":
-                            loss = model.compute_loss(outputs, dat, "bce")
+                            loss = model.compute_loss(outputs, dat)
                         else:
-                            loss = model.compute_loss(outputs, dat, "gauss")
+                            loss = model.compute_loss(outputs, dat)
 
-                        test_losses.append(-1 * loss)
+                        if FLAGS.estimate_prob:
+                            estimate_prob = model.estimate_prob(dat).item()
+                            test_losses.append(estimate_prob)
+                        else:
+                            test_losses.append(-1 * loss)
 
 
                 it += FLAGS.batch_size
@@ -249,12 +314,19 @@ def main():
                 data_string = "MNIST"
             plt.title("{}, $N_z = {}$".format(data_string, FLAGS.latent_dim))
             time = str(datetime.datetime.now())
-            plt.savfig("plot_{}_{}_{}.png".format(FLAGS.dataset, time, FLAGS.latent_dim))
+            plt.savefig("plot_{}_{}_{}.png".format(FLAGS.dataset, time, FLAGS.latent_dim))
 
         model_path = osp.join(logdir, "model_{}".format(it))
         torch.save(model.state_dict(), model_path)
 
-    output = model.generate_sample()
+    if FLAGS.latent_traversal:
+        intervals = np.linspace(-1, 1, 8)
+        grid = np.meshgrid(intervals, intervals)
+        value = np.stack([grid[0], grid[1]], axis=2)
+        latent_input = torch.from_numpy(value.reshape((64, 2))).float().cuda()
+        output = model.generate_sample(z=latent_input)
+    else:
+        output = model.generate_sample()
     output = output.cpu().detach().numpy()
 
     if FLAGS.dataset == "mnist":
